@@ -1,0 +1,151 @@
+name: Pipeline Completo CI/CD (SonarQube + Selenium + JMeter)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  calidad-y-pruebas:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 2. Levantar entorno (Postgres + Backend + Frontend)
+        run: |
+          docker compose up -d --build
+          echo "Esperando a Frontend (3350) y Backend (4450)..."
+          timeout 60 bash -c 'until curl -s http://localhost:3350 > /dev/null; do sleep 2; done'
+          timeout 60 bash -c 'until curl -s http://localhost:4450 > /dev/null || [ $? -eq 22 ]; do sleep 2; done'
+          echo "Entorno levantado correctamente."
+
+      - name: 3. Análisis Estático con SonarQube
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=TU_PROJECT_KEY
+            -Dsonar.organization=TU_ORGANIZACION
+            -Dsonar.sources=BACKEND,FRONTEND
+            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/uploads/**
+
+      - name: 3.1 Verificar Quality Gate de SonarQube
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: 4. Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 4.1 Instalar Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: 4.2 Ejecutar prueba funcional de Selenium
+        run: |
+          pip install selenium pytest pytest-html
+          cat << 'EOF' > test_create_user.py
+          import pytest
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.action_chains import ActionChains
+          from selenium.webdriver.common.keys import Keys
+
+          class TestNewTest():
+            def setup_method(self, method):
+              options = Options()
+              options.add_argument("--headless=new")
+              options.add_argument("--no-sandbox")
+              options.add_argument("--disable-dev-shm-usage")
+              options.add_argument("--window-size=1920,1080")
+              self.driver = webdriver.Chrome(options=options)
+              self.driver.implicitly_wait(10)
+
+            def teardown_method(self, method):
+              self.driver.quit()
+
+            def test_newTest(self):
+              self.driver.get("http://localhost:3350/login")
+              self.driver.find_element(By.ID, "nombre_usuario").send_keys("admin")
+              self.driver.find_element(By.ID, "password").send_keys("admin")
+              self.driver.find_element(By.ID, "password").send_keys(Keys.ENTER)
+              element = self.driver.find_element(By.LINK_TEXT, "Clientes")
+              ActionChains(self.driver).move_to_element(element).perform()
+              self.driver.find_element(By.CSS_SELECTOR, '[data-testid="link-nav-clientes"] > div > span').click()
+              element = self.driver.find_element(By.CSS_SELECTOR, '[role="tablist"] > button:nth-of-type(1)')
+              ActionChains(self.driver).move_to_element(element).perform()
+              self.driver.find_element(By.CSS_SELECTOR, '[role="tablist"] > button:nth-of-type(2)').click()
+              self.driver.find_element(By.ID, "rut-cliente-create").send_keys("12345678-9")
+              self.driver.find_element(By.ID, "nombre-cliente-create").send_keys("Usuario Prueba")
+              self.driver.find_element(By.ID, "crear-cliente-create").click()
+          EOF
+
+          mkdir -p reportes/selenium
+          pytest -v test_create_user.py --html=reportes/selenium/reporte-selenium.html --self-contained-html
+
+      - name: 5. Instalar y ejecutar pruebas de carga con JMeter
+        run: |
+          sudo apt-get update && sudo apt-get install -y openjdk-17-jre-headless wget
+          wget -q https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.6.3.tgz
+          tar -xzf apache-jmeter-5.6.3.tgz
+          mkdir -p reportes/jmeter
+
+          cat << 'EOF' > plan-carga.jmx
+          <?xml version="1.0" encoding="UTF-8"?>
+          <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+            <hashTree>
+              <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Plan Carga Atlas" enabled="true"/>
+              <hashTree>
+                <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Usuarios Concurrentes" enabled="true">
+                  <stringProp name="ThreadGroup.on_sample_error">stoptest</stringProp>
+                  <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+                    <boolProp name="LoopController.continue_forever">false</boolProp>
+                    <stringProp name="LoopController.loops">5</stringProp>
+                  </elementProp>
+                  <stringProp name="ThreadGroup.num_threads">20</stringProp>
+                  <stringProp name="ThreadGroup.ramp_time">5</stringProp>
+                </ThreadGroup>
+                <hashTree>
+                  <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET Frontend" enabled="true">
+                    <stringProp name="HTTPSampler.domain">localhost</stringProp>
+                    <stringProp name="HTTPSampler.port">3350</stringProp>
+                    <stringProp name="HTTPSampler.protocol">http</stringProp>
+                    <stringProp name="HTTPSampler.path">/</stringProp>
+                    <stringProp name="HTTPSampler.method">GET</stringProp>
+                  </HTTPSamplerProxy>
+                  <hashTree/>
+                </hashTree>
+              </hashTree>
+            </hashTree>
+          </jmeterTestPlan>
+          EOF
+
+          ./apache-jmeter-5.6.3/bin/jmeter -n -t plan-carga.jmx -l reportes/jmeter/resultados.jtl -e -o reportes/jmeter/dashboard
+
+          if grep -q ",false," reportes/jmeter/resultados.jtl; then
+            echo "ERROR: Fallaron peticiones durante la prueba de carga JMeter."
+            exit 1
+          fi
+
+      - name: 6. Generar y guardar reporte de evidencias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidencias-pipeline-${{ github.run_number }}
+          path: reportes/
+          retention-days: 30
+
+      - name: 7. Apagar contenedores
+        if: always()
+        run: docker compose down -v
